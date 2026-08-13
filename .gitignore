@@ -1,0 +1,14 @@
+# Build output
+*.zip
+
+# ProcMon captures (large)
+*.pml
+*.csv
+
+# Local scratch
+scratch/
+tmp/
+
+# Windows
+Thumbs.db
+desktop.ini

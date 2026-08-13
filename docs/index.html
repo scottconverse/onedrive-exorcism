@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OneDrive Exorcism &mdash; a Windows playbook</title>
+<meta name="description" content="Removing OneDrive is the easy part. Undoing what it did to your folders is where everyone gets stuck. A Windows playbook, a Claude skill, and two PowerShell scripts.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>%F0%9F%A7%B9</text></svg>">
+<style>
+  :root {
+    --ground:      #EDF1F5;
+    --surface:     #FFFFFF;
+    --surface-alt: #E3E9EF;
+    --ink:         #101922;
+    --ink-muted:   #5B6875;
+    --rule:        #C9D3DC;
+    --accent:      #9C6318;
+    --accent-soft: #F5E7D2;
+    --pass:        #1B6F5F;
+    --mono-bg:     #E6EBF0;
+    --shadow:      0 1px 2px rgba(16,25,34,.06), 0 10px 30px -20px rgba(16,25,34,.35);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #0D1319;
+      --surface:     #151E27;
+      --surface-alt: #1D2833;
+      --ink:         #DEE6ED;
+      --ink-muted:   #8A99A7;
+      --rule:        #2A3743;
+      --accent:      #DFA455;
+      --accent-soft: #2A2114;
+      --pass:        #4FAE97;
+      --mono-bg:     #101922;
+      --shadow:      0 1px 2px rgba(0,0,0,.4), 0 10px 30px -20px rgba(0,0,0,.8);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:      #0D1319;
+    --surface:     #151E27;
+    --surface-alt: #1D2833;
+    --ink:         #DEE6ED;
+    --ink-muted:   #8A99A7;
+    --rule:        #2A3743;
+    --accent:      #DFA455;
+    --accent-soft: #2A2114;
+    --pass:        #4FAE97;
+    --mono-bg:     #101922;
+    --shadow:      0 1px 2px rgba(0,0,0,.4), 0 10px 30px -20px rgba(0,0,0,.8);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+    font-size: 16px;
+    line-height: 1.65;
+    padding: clamp(1.5rem, 4vw, 3.5rem) 1.25rem 5rem;
+  }
+  .page { max-width: 52rem; margin: 0 auto; display: flex; flex-direction: column; gap: 3.25rem; }
+
+  code, .mono {
+    font-family: "Cascadia Mono", "Cascadia Code", ui-monospace, Consolas, monospace;
+    font-size: .875em; font-variant-ligatures: none;
+  }
+  code { background: var(--mono-bg); padding: .12em .38em; border-radius: 3px; overflow-wrap: anywhere; }
+  a { color: var(--accent); text-underline-offset: .18em; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+
+  header { display: flex; flex-direction: column; gap: 1.1rem; }
+  .eyebrow { font-size: .72rem; letter-spacing: .16em; text-transform: uppercase; color: var(--accent); font-weight: 650; }
+  h1 {
+    font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+    font-size: clamp(2.1rem, 6vw, 3.4rem); line-height: 1.05; letter-spacing: -.024em;
+    font-weight: 700; margin: 0; text-wrap: balance;
+  }
+  .standfirst { font-size: 1.15rem; color: var(--ink-muted); margin: 0; max-width: 38rem; text-wrap: pretty; }
+
+  .cta { display: flex; flex-wrap: wrap; gap: .7rem; margin-top: .3rem; }
+  .btn {
+    display: inline-block; padding: .6rem 1.15rem; border-radius: 4px;
+    font-size: .92rem; font-weight: 620; text-decoration: none;
+    border: 1px solid var(--rule); background: var(--surface); color: var(--ink);
+  }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--ground); }
+  .btn:hover { border-color: var(--accent); }
+
+  section { display: flex; flex-direction: column; gap: 1rem; }
+  h2 {
+    font-family: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+    font-size: 1.45rem; letter-spacing: -.014em; font-weight: 660; margin: 0; text-wrap: balance;
+  }
+  h3 { font-size: 1rem; font-weight: 650; margin: 0; }
+  p { margin: 0; max-width: 42rem; text-wrap: pretty; }
+
+  .symptoms { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: .8rem; }
+  .symptom {
+    background: var(--surface); border: 1px solid var(--rule); border-radius: 4px;
+    padding: .9rem 1rem; font-size: .93rem; box-shadow: var(--shadow);
+  }
+
+  .trap {
+    background: var(--surface); border: 1px solid var(--rule); border-left: 3px solid var(--accent);
+    border-radius: 4px; padding: 1.25rem 1.4rem; box-shadow: var(--shadow);
+    display: flex; flex-direction: column; gap: .7rem;
+  }
+  .trap-tag { font-size: .7rem; letter-spacing: .13em; text-transform: uppercase; font-weight: 660; color: var(--accent); }
+  .tell { background: var(--accent-soft); border-radius: 3px; padding: .6rem .8rem; font-size: .9rem; font-style: italic; }
+  .traps { display: flex; flex-direction: column; gap: 1.1rem; }
+
+  pre {
+    margin: 0; background: var(--surface); border: 1px solid var(--rule); border-radius: 4px;
+    padding: .95rem 1.1rem; overflow-x: auto; box-shadow: var(--shadow);
+  }
+  pre code { background: none; padding: 0; font-size: .855rem; line-height: 1.7; }
+  .comment { color: var(--ink-muted); }
+
+  ul.checks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .5rem; font-size: .95rem; }
+  ul.checks li { display: grid; grid-template-columns: 1.3rem 1fr; gap: .5rem; align-items: start; }
+  ul.checks li::before { content: "\2713"; color: var(--pass); font-weight: 700; }
+
+  ul.bounds { margin: 0; padding-left: 1.15rem; display: flex; flex-direction: column; gap: .45rem; font-size: .95rem; color: var(--ink-muted); }
+  ul.bounds b { color: var(--ink); font-weight: 620; }
+
+  footer { border-top: 1px solid var(--rule); padding-top: 1.3rem; font-size: .85rem; color: var(--ink-muted); display: flex; flex-direction: column; gap: .5rem; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header>
+    <div class="eyebrow">Windows 10 &amp; 11 &middot; PowerShell &middot; Claude skill</div>
+    <h1>OneDrive Exorcism</h1>
+    <p class="standfirst">Removing the app is the easy part. Undoing what it did to your
+      folders is where everyone gets stuck &mdash; and on some machines the fix silently
+      never reaches the registry at all.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/scottconverse/onedrive-exorcism">View on GitHub</a>
+      <a class="btn" href="https://github.com/scottconverse/onedrive-exorcism/blob/main/MANUAL.md">User manual</a>
+      <a class="btn" href="https://github.com/scottconverse/onedrive-exorcism/blob/main/PLAYBOOK.md">Playbook</a>
+    </div>
+  </header>
+
+  <section>
+    <h2>If any of these sound familiar</h2>
+    <div class="symptoms">
+      <div class="symptom">You delete the OneDrive folder and it comes back.</div>
+      <div class="symptom">Files saved to &ldquo;Desktop&rdquo; land somewhere else.</div>
+      <div class="symptom">Your desktop suddenly shows only shared shortcuts.</div>
+      <div class="symptom">Explorer refuses to create or rename a folder.</div>
+      <div class="symptom"><code>0x800401E5</code> &mdash; No object for moniker.</div>
+      <div class="symptom">The fix worked, verified, rebooted &mdash; and nothing changed.</div>
+    </div>
+    <p>Uninstalling OneDrive does <em>not</em> repoint Desktop, Documents, and Pictures. Those
+      are literal paths in the registry, so Windows keeps writing into a OneDrive folder it
+      recreates on demand &mdash; with no sync, no client, and no account.</p>
+  </section>
+
+  <section class="traps">
+    <h2>Two traps that make a broken machine look fixed</h2>
+
+    <div class="trap">
+      <div class="trap-tag">Trap 1 &mdash; the fake registry</div>
+      <h3>Packaged apps can see an overlay, not the machine</h3>
+      <p>A tool running inside a packaged (MSIX/Store) app may see a copy-on-write overlay of
+        machine state. Writes land in a private hive; later reads return that copy. The fix
+        applies, verification passes, the machine is untouched &mdash; through reboots.</p>
+      <p>Not just the registry: in the field, a scheduled-task query returned <em>zero</em>
+        OneDrive tasks while three were live and armed.</p>
+      <div class="tell">Tell: the fix succeeded, verification passed, and nothing changed.</div>
+    </div>
+
+    <div class="trap">
+      <div class="trap-tag">Trap 2 &mdash; the cleanup that breaks Explorer</div>
+      <h3>Deleting a built-in folder description breaks New Folder everywhere</h3>
+      <p>Deleting OneDrive's known-folder definition while child definitions still reference it
+        leaves a dangling parent. Explorer walks that graph during file operations, so
+        <b>New&nbsp;Folder and rename break system-wide</b> &mdash; desktop, every drive, every
+        dialog.</p>
+      <div class="tell">The new folder appears in the view but never exists on disk, so every
+        file-system test passes while the shell is thoroughly broken.</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Run it</h2>
+    <h3>With Claude Code</h3>
+    <pre><code><span class="comment"># copy skill/ to ~/.claude/skills/onedrive-exorcism/, then:</span>
+/onedrive-exorcism</code></pre>
+    <h3>With plain PowerShell, elevated</h3>
+    <pre><code><span class="comment"># look before you leap - changes nothing</span>
+.\skill\scripts\Invoke-OneDriveExorcism.ps1 -InventoryOnly
+
+<span class="comment"># do it</span>
+.\skill\scripts\Invoke-OneDriveExorcism.ps1
+
+<span class="comment"># New Folder / rename broken, OneDrive or not?</span>
+.\skill\scripts\Repair-KnownFolderGraph.ps1</code></pre>
+    <p>Both scripts are idempotent, report <span class="mono">PRESENT</span> vs
+      <span class="mono">absent</span> for every item, and end in a PASS/FAIL audit.</p>
+  </section>
+
+  <section>
+    <h2>What you get back</h2>
+    <ul class="checks">
+      <li>Desktop, Documents, and Pictures pointing at your local profile again &mdash; all six registry values, not the usual three</li>
+      <li>Three Windows policies blocking OneDrive from redirecting or phoning home ever again</li>
+      <li>Client, autostart entries, scheduled updater tasks, sync roots, and config keys removed</li>
+      <li>A repaired known-folder graph, so Explorer can create and rename folders</li>
+      <li>Stale dialog history cleared, so saves stop landing in a folder that no longer exists</li>
+      <li>A PASS/FAIL audit you can actually trust, taken from outside the container</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Read this first</h2>
+    <p><b>Files with a blue cloud icon are not on your PC.</b> They exist only at
+      onedrive.com. Removing OneDrive does not delete them from the cloud, but it does make
+      them unreachable from this machine. Run <code>-InventoryOnly</code> to count them, and
+      download anything you need before proceeding.</p>
+    <ul class="bounds">
+      <li><b>Leave Windows servicing alone</b> &mdash; <code>CldFlt</code>, WinSxS, the component store. Deleting them buys nothing and breaks SFC and Windows Update.</li>
+      <li><b>Never delete <code>SyncRootManager</code> itself</b> &mdash; other cloud providers register there.</li>
+      <li><b>The empty folder is cosmetic; the redirection is the bug.</b> Escalating against a harmless leftover is what causes Trap 2.</li>
+    </ul>
+  </section>
+
+  <footer>
+    <div>Written after a Windows 11 machine spent three days appearing to be fixed. Four
+      sessions repointed the registry, verified it, rebooted, and watched files keep landing
+      in OneDrive &mdash; because every write had gone into a packaged app's private registry
+      overlay.</div>
+    <div>MIT licensed. No warranty: these scripts modify the registry, delete folders, and
+      remove scheduled tasks. Read them first.</div>
+  </footer>
+
+</div>
+</body>
+</html>
