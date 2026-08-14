@@ -53,6 +53,7 @@ if (-not $dangling) {
 }
 
 $toRestore = $dangling.MissingParent | Sort-Object -Unique
+$restoredCount = 0
 foreach ($guid in $toRestore) {
     if (-not $known.ContainsKey($guid)) {
         Write-Output "NOTE: no restore template for $guid - inspect a healthy machine's FolderDescriptions and add one."
@@ -69,9 +70,10 @@ foreach ($guid in $toRestore) {
     $key.Close()
     # Deliberately no PreCreate value: the definition registers the folder without creating it.
     Write-Output "RESTORED $guid ($($def.Name)) - registration only, creates no folder"
+    $restoredCount++
 }
 
-if (-not $WhatIfOnly -and $toRestore) {
+if (-not $WhatIfOnly -and $restoredCount -gt 0) {
     Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Seconds 3
     if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }

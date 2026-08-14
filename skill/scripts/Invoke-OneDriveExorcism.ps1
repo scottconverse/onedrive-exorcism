@@ -1,287 +1,260 @@
 <#
 .SYNOPSIS
-    Remove OneDrive and undo its Known Folder Move redirection, then audit the result.
-
+    Inventory or safely remove OneDrive and undo Known Folder Move redirection.
 .DESCRIPTION
-    MUST be run OUTSIDE any packaged-app container (see references/elevated-helper.md).
-    Idempotent: safe to re-run. Reports PRESENT vs absent for every item and ends with
-    a PASS/FAIL audit.
-
-    Order matters. Known folders are repointed and policy is set BEFORE the OneDrive
-    folder is deleted, so nothing re-creates it.
-
-.PARAMETER InventoryOnly
-    Report cloud-only placeholder counts and current redirection state; change nothing.
-
-.PARAMETER SkipFolderDelete
-    Do everything except delete the OneDrive data folder (use when files are still
-    cloud-only and the user has not decided yet).
-
-.PARAMETER UserName
-    Target user profile. Defaults to the current user.
+    Inventory is the default. Changes require -Apply and must run outside a packaged-app
+    container as the interactive target user. Locally available Desktop, Documents, and
+    Pictures files are moved to the local profile before registry changes. Data folders
+    are retained unless -DeleteOneDriveData is explicitly supplied.
 #>
 [CmdletBinding()]
 param(
+    [switch]$Apply,
     [switch]$InventoryOnly,
-    [switch]$SkipFolderDelete,
-    [string]$UserName = $env:USERNAME
+    [switch]$ConfirmCloudOnlyLoss,
+    [switch]$DeleteOneDriveData,
+    [switch]$ClearShellHistory
 )
 
 $ErrorActionPreference = 'Stop'
-$profileRoot = "C:\Users\$UserName"
-$oneDrive    = Join-Path $profileRoot 'OneDrive'
-$results     = [ordered]@{}
-
-function Say  { param([string]$m) Write-Output $m }
-function Head { param([string]$m) Write-Output ''; Write-Output "=== $m ===" }
-
-# ---------------------------------------------------------------- 0. Inventory
-Head '0. Inventory'
-Say "Profile root: $profileRoot"
-Say "OneDrive folder: $(if (Test-Path -LiteralPath $oneDrive) { 'PRESENT ' + $oneDrive } else { 'absent' })"
-
-if (Test-Path -LiteralPath $oneDrive) {
-    $cloudOnly = 0; $cloudBytes = 0; $local = 0
-    Get-ChildItem -LiteralPath $oneDrive -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
-        # Offline / RecallOnDataAccess => content lives only in the cloud
-        if (($_.Attributes -band [IO.FileAttributes]::Offline) -or ($_.Attributes.value__ -band 0x400000)) {
-            $cloudOnly++; $cloudBytes += $_.Length
-        } else { $local++ }
-    }
-    Say "Cloud-only placeholders: $cloudOnly file(s), $([math]::Round($cloudBytes/1GB,2)) GB"
-    Say "Files actually stored locally: $local"
-    if ($cloudOnly -gt 0) {
-        Say "WARNING: those $cloudOnly file(s) exist only at onedrive.com. Removing OneDrive"
-        Say "         makes them unreachable on this PC. Confirm with the user first."
-    }
+function Say { param([string]$Text) Write-Output $Text }
+function Head { param([string]$Text) Say ''; Say "=== $Text ===" }
+function IsCloud { param([IO.FileInfo]$File) [bool](($File.Attributes -band [IO.FileAttributes]::Offline) -or ($File.Attributes.value__ -band 0x400000)) }
+function Canon { param([string]$Path) [IO.Path]::GetFullPath($Path).TrimEnd('\') }
+function IsWithin {
+    param([string]$Path,[string]$Root)
+    ((Canon $Path) + '\').StartsWith(((Canon $Root) + '\'), [StringComparison]::OrdinalIgnoreCase)
+}
+function FilesUnder {
+    param([string]$Root)
+    if (Test-Path -LiteralPath $Root) { @(Get-ChildItem -LiteralPath $Root -Recurse -Force -File -ErrorAction Stop) } else { @() }
+}
+function ExactRegistryValue {
+    param([Microsoft.Win32.RegistryKey]$Key,[string]$Name,[object]$Value,[Microsoft.Win32.RegistryValueKind]$Kind,[switch]$Raw)
+    if (-not $Key -or -not ($Key.GetValueNames() -contains $Name)) { return $false }
+    $option = if ($Raw) { [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames } else { [Microsoft.Win32.RegistryValueOptions]::None }
+    $Key.GetValue($Name,$null,$option) -eq $Value -and $Key.GetValueKind($Name) -eq $Kind
 }
 
-$usfPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
-$sfPath  = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
-$kfNames = @(
-    @{ Name = 'Desktop';                                    Target = '%USERPROFILE%\Desktop'   },
-    @{ Name = 'Personal';                                   Target = '%USERPROFILE%\Documents' },
-    @{ Name = 'My Pictures';                                Target = '%USERPROFILE%\Pictures'  },
-    @{ Name = '{F42EE2D3-909F-4907-8871-4C22FC0BF756}';     Target = '%USERPROFILE%\Documents' },
-    @{ Name = '{0DDD015D-B06C-45D5-8C4C-F59713854639}';     Target = '%USERPROFILE%\Pictures'  },
-    @{ Name = '{754AC886-DF64-4CBA-86B5-F7FBF4FBCEF5}';     Target = '%USERPROFILE%\Desktop'   }
+if ($Apply -and $InventoryOnly) { throw '-Apply and -InventoryOnly are mutually exclusive.' }
+if (($DeleteOneDriveData -or $ClearShellHistory) -and -not $Apply) { throw 'Destructive options require -Apply.' }
+
+$profileRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+if (-not $profileRoot -or -not (Test-Path -LiteralPath $profileRoot)) { throw 'Cannot resolve the current user profile.' }
+$profileRoot = Canon $profileRoot
+$oneDrive = Join-Path $profileRoot 'OneDrive'
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+if ($Apply -and -not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw '-Apply must run elevated as the interactive target user.'
+}
+
+$usfSub = 'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders'
+$sfSub = 'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders'
+$folders = @(
+    [pscustomobject]@{Name='Desktop';Folder='Desktop'},
+    [pscustomobject]@{Name='Personal';Folder='Documents'},
+    [pscustomobject]@{Name='My Pictures';Folder='Pictures'},
+    [pscustomobject]@{Name='{F42EE2D3-909F-4907-8871-4C22FC0BF756}';Folder='Documents'},
+    [pscustomobject]@{Name='{0DDD015D-B06C-45D5-8C4C-F59713854639}';Folder='Pictures'},
+    [pscustomobject]@{Name='{754AC886-DF64-4CBA-86B5-F7FBF4FBCEF5}';Folder='Desktop'}
 )
 
-Head '0b. Current known-folder redirection (REAL registry)'
-$redirected = @()
-foreach ($kf in $kfNames) {
-    $v = (Get-Item $usfPath).GetValue($kf.Name, '(absent)', 'DoNotExpandEnvironmentNames')
-    if ($v -like '*OneDrive*') { $redirected += $kf.Name; Say "HIJACKED  $($kf.Name) = $v" }
-    else { Say "ok        $($kf.Name) = $v" }
-}
-$results['redirected_before'] = $redirected.Count
+Head '0. Inventory'
+Say "Identity: $($identity.Name)"
+Say "Profile: $profileRoot"
+Say "OneDrive: $(if (Test-Path -LiteralPath $oneDrive) { 'PRESENT' } else { 'absent' }) $oneDrive"
+$allFiles = FilesUnder $oneDrive
+$cloudFiles = @($allFiles | Where-Object { IsCloud $_ })
+$localFiles = @($allFiles | Where-Object { -not (IsCloud $_) })
+$cloudBytes = ($cloudFiles | Measure-Object Length -Sum).Sum; if ($null -eq $cloudBytes) { $cloudBytes = 0 }
+Say "Cloud-only: $($cloudFiles.Count) file(s), $([math]::Round($cloudBytes/1GB,2)) GB"
+Say "Locally available: $($localFiles.Count) file(s)"
 
-if ($InventoryOnly) { Say ''; Say 'InventoryOnly: no changes made.'; return }
-
-# ------------------------------------------------- 1. Repoint the known folders
-Head '1. Repointing known folders'
-$k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
-        'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders', $true)
-foreach ($kf in $kfNames) {
-    if ($k.GetValueNames() -contains $kf.Name) {
-        $k.SetValue($kf.Name, $kf.Target, [Microsoft.Win32.RegistryValueKind]::ExpandString)
-        Say "set USF $($kf.Name) -> $($kf.Target)"
+$sourceByFolder = @{}
+$usf = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($usfSub,$false)
+foreach ($item in $folders) {
+    $value = if ($usf) { $usf.GetValue($item.Name,'(absent)',[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } else { '(absent)' }
+    $state = if ($value -like '*OneDrive*') { 'HIJACKED' } elseif ($value -eq '(absent)') { 'MISSING ' } else { 'ok      ' }
+    Say "$state $($item.Name) = $value"
+    if ($item.Name -in @('Desktop','Personal','My Pictures') -and $value -ne '(absent)') {
+        $sourceByFolder[$item.Folder] = [Environment]::ExpandEnvironmentVariables([string]$value)
     }
 }
-$k.Close()
-
-$k2 = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
-        'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders', $true)
-foreach ($pair in @(@('Desktop','Desktop'), @('Personal','Documents'), @('My Pictures','Pictures'))) {
-    if ($k2.GetValueNames() -contains $pair[0]) {
-        $k2.SetValue($pair[0], (Join-Path $profileRoot $pair[1]), [Microsoft.Win32.RegistryValueKind]::String)
-        Say "set SF  $($pair[0]) -> $(Join-Path $profileRoot $pair[1])"
-    }
-}
-$k2.Close()
-
-foreach ($d in @('Desktop','Documents','Pictures')) {
-    $p = Join-Path $profileRoot $d
-    if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p | Out-Null; Say "created missing $p" }
+if ($usf) { $usf.Close() }
+if (-not $Apply) { Say ''; Say 'INVENTORY ONLY: no changes made. Use -Apply after review.'; return }
+if ($cloudFiles.Count -gt 0 -and -not $ConfirmCloudOnlyLoss) {
+    throw "Found $($cloudFiles.Count) cloud-only placeholder(s). Hydrate them or explicitly pass -ConfirmCloudOnlyLoss."
 }
 
-# --------------------------------------------------------------- 2. Policy lock
-Head '2. Policy'
-$polW = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\Policies\Microsoft\Windows\OneDrive')
-$polW.SetValue('DisableFileSyncNGSC', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
-$polW.SetValue('PreventNetworkTrafficPreUserSignIn', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
-$polW.Close()
-$polO = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\Policies\Microsoft\OneDrive')
-$polO.SetValue('KFMBlockOptIn', 1, [Microsoft.Win32.RegistryValueKind]::DWord)
-$polO.Close()
-Say 'DisableFileSyncNGSC=1, PreventNetworkTrafficPreUserSignIn=1, KFMBlockOptIn=1'
-
-# ------------------------------------------------------------- 3. Uninstall app
-Head '3. Uninstall client'
-$setups = @("$env:SystemRoot\SysWOW64\OneDriveSetup.exe", "$env:SystemRoot\System32\OneDriveSetup.exe")
-$installed = @("$profileRoot\AppData\Local\Microsoft\OneDrive\OneDrive.exe",
-               'C:\Program Files\Microsoft OneDrive\OneDrive.exe',
-               'C:\Program Files (x86)\Microsoft OneDrive\OneDrive.exe') | Where-Object { Test-Path -LiteralPath $_ }
-if ($installed) {
-    Say "Client present: $($installed -join ', ')"
-    Get-Process OneDrive -ErrorAction SilentlyContinue | ForEach-Object {
-        Start-Process -FilePath $_.Path -ArgumentList '/shutdown' -ErrorAction SilentlyContinue
+Head '1. Preflight migration'
+$moves = New-Object System.Collections.Generic.List[object]
+$directories = New-Object System.Collections.Generic.List[string]
+foreach ($folderName in @('Desktop','Documents','Pictures')) {
+    $source = $sourceByFolder[$folderName]; $target = Join-Path $profileRoot $folderName
+    if (-not $source -or -not (Test-Path -LiteralPath $source)) { Say "absent source: $folderName"; continue }
+    if ((Canon $source) -eq (Canon $target)) { Say "already local: $folderName"; continue }
+    if (-not (IsWithin $source $oneDrive)) { throw "Unexpected $folderName source '$source'; review manually." }
+    $items = @(Get-ChildItem -LiteralPath $source -Recurse -Force -ErrorAction Stop)
+    $reparse = @($items | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })
+    if ($reparse.Count) { throw "Reparse point blocks safe migration: $($reparse[0].FullName)" }
+    foreach ($dir in @($items | Where-Object PSIsContainer)) {
+        $relative = $dir.FullName.Substring((Canon $source).Length).TrimStart('\')
+        $destination = Join-Path $target $relative
+        if (Test-Path -LiteralPath $destination -PathType Leaf) { throw "Directory collision: $destination" }
+        $directories.Add($destination)
     }
-    Start-Sleep -Seconds 3
+    $planned = 0
+    foreach ($file in @($items | Where-Object { -not $_.PSIsContainer -and -not (IsCloud $_) })) {
+        $relative = $file.FullName.Substring((Canon $source).Length).TrimStart('\')
+        $destination = Join-Path $target $relative
+        if (Test-Path -LiteralPath $destination) { throw "File collision: $destination. Reconcile it and rerun." }
+        $moves.Add([pscustomobject]@{Source=$file.FullName;Destination=$destination}); $planned++
+    }
+    Say "planned: $planned local file(s) from $source"
+}
+
+Head '2. Migrate local content'
+foreach ($folderName in @('Desktop','Documents','Pictures')) {
+    $target = Join-Path $profileRoot $folderName
+    if (-not (Test-Path -LiteralPath $target)) { New-Item -ItemType Directory -Path $target -Force | Out-Null; Say "created: $target" }
+}
+foreach ($directory in @($directories | Sort-Object -Unique)) { if (-not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null } }
+foreach ($move in $moves) {
+    $parent = Split-Path -Parent $move.Destination
+    if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    Move-Item -LiteralPath $move.Source -Destination $move.Destination
+    if ((Test-Path -LiteralPath $move.Source) -or -not (Test-Path -LiteralPath $move.Destination)) { throw "Move verification failed: $($move.Source)" }
+}
+Say "migrated and verified: $($moves.Count) file(s)"
+
+Head '3. Repoint known folders'
+$usf = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($usfSub)
+$sf = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($sfSub)
+foreach ($item in $folders) {
+    $expanded = Join-Path $profileRoot $item.Folder; $raw = "%USERPROFILE%\$($item.Folder)"
+    $usf.SetValue($item.Name,$raw,[Microsoft.Win32.RegistryValueKind]::ExpandString)
+    $sf.SetValue($item.Name,$expanded,[Microsoft.Win32.RegistryValueKind]::String)
+    Say "set: $($item.Name) -> $expanded"
+}
+$usf.Close(); $sf.Close()
+
+Head '4. Policy'
+$policies = @(
+    @('SOFTWARE\Policies\Microsoft\Windows\OneDrive','DisableFileSyncNGSC'),
+    @('SOFTWARE\Policies\Microsoft\OneDrive','PreventNetworkTrafficPreUserSignIn'),
+    @('SOFTWARE\Policies\Microsoft\OneDrive','KFMBlockOptIn'))
+foreach ($policy in $policies) {
+    $key = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey($policy[0]); $before = $key.GetValue($policy[1],'(absent)')
+    $key.SetValue($policy[1],1,[Microsoft.Win32.RegistryValueKind]::DWord); $after = $key.GetValue($policy[1]); $key.Close()
+    Say "$($policy[1]): before=$before after=$after"
+}
+
+Head '5. Remove client and launch points'
+$clientPaths = @((Join-Path $profileRoot 'AppData\Local\Microsoft\OneDrive\OneDrive.exe'),'C:\Program Files\Microsoft OneDrive\OneDrive.exe','C:\Program Files (x86)\Microsoft OneDrive\OneDrive.exe')
+$clients = @($clientPaths | Where-Object { Test-Path -LiteralPath $_ })
+if ($clients.Count) {
+    Say "client PRESENT: $($clients -join ', ')"
     Get-Process OneDrive -ErrorAction SilentlyContinue | Stop-Process -Force
-    foreach ($s in $setups) {
-        if (Test-Path -LiteralPath $s) { Say "running $s /uninstall"; & $s /uninstall; Start-Sleep -Seconds 20 }
+    $setup = @("$env:SystemRoot\SysWOW64\OneDriveSetup.exe","$env:SystemRoot\System32\OneDriveSetup.exe") | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $setup) { throw 'OneDrive is present but OneDriveSetup.exe was not found.' }
+    $process = Start-Process -FilePath $setup -ArgumentList '/uninstall' -Wait -PassThru
+    Say "uninstaller exit: $($process.ExitCode)"; if ($process.ExitCode -ne 0) { throw "Uninstall failed: $($process.ExitCode)" }
+} else { Say 'client absent' }
+foreach ($path in @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Run','HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run','HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run')) {
+    $key = Get-Item $path -ErrorAction SilentlyContinue; $names = if ($key) { @($key.GetValueNames() | Where-Object { $_ -match 'OneDrive' }) } else { @() }
+    if (-not $names.Count) { Say "absent: $path OneDrive values" }
+    foreach ($name in $names) { Remove-ItemProperty $path $name -Force; Say "removed: $path\$name" }
+}
+foreach ($startup in @((Join-Path $profileRoot 'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup'),'C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup')) {
+    $links = @(Get-ChildItem -LiteralPath $startup -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'OneDrive' })
+    if (-not $links.Count) { Say "absent: OneDrive shortcuts in $startup" }
+    foreach ($link in $links) { Remove-Item -LiteralPath $link.FullName -Force; Say "removed: $($link.FullName)" }
+}
+$tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -match 'OneDrive' -or $_.TaskPath -match 'OneDrive' })
+if (-not $tasks.Count) { Say 'absent: OneDrive scheduled tasks' }
+foreach ($task in $tasks) { Unregister-ScheduledTask $task.TaskName -TaskPath $task.TaskPath -Confirm:$false; Say "removed task: $($task.TaskPath)$($task.TaskName)" }
+
+Head '6. Registry remnants'
+foreach ($path in @('HKCU:\Software\Microsoft\OneDrive','HKCU:\Software\Classes\grvopen')) {
+    if (Test-Path $path) { Remove-Item $path -Recurse -Force; Say "removed: $path" } else { Say "absent: $path" }
+}
+foreach ($root in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager','HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager')) {
+    $children = if (Test-Path $root) { @(Get-ChildItem $root | Where-Object { $_.PSChildName -match 'OneDrive' }) } else { @() }
+    if (-not $children.Count) { Say "absent: OneDrive children under $root" }
+    foreach ($child in $children) { Remove-Item -LiteralPath $child.PSPath -Recurse -Force; Say "removed sync root: $($child.PSChildName)" }
+}
+foreach ($path in @('HKCU:\Software\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}','HKCU:\Software\Classes\WOW6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}','HKLM:\SOFTWARE\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}','HKLM:\SOFTWARE\Classes\WOW6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}')) {
+    if (Test-Path $path) { Set-ItemProperty $path 'System.IsPinnedToNameSpaceTree' 0 -Type DWord -Force; Say "unpinned: $path" } else { Say "absent: $path" }
+}
+
+if ($ClearShellHistory) {
+    Head '7. Explicit shell-history cleanup'
+    foreach ($path in @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\ComDlg32\LastVisitedPidlMRU','HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\ComDlg32\OpenSavePidlMRU','HKCU:\Software\Microsoft\Windows\Shell\Bags\1\Desktop')) {
+        if (Test-Path $path) { Remove-Item $path -Recurse -Force; Say "cleared: $path" } else { Say "absent: $path" }
     }
-} else { Say 'OneDrive client already absent' }
-
-# ------------------------------------------------------- 4. Autostart and tasks
-Head '4. Autostart and scheduled tasks'
-foreach ($rk in @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
-                  'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run')) {
-    $r = Get-Item $rk -ErrorAction SilentlyContinue
-    if ($r) { foreach ($n in $r.GetValueNames()) {
-        if ($n -match 'OneDrive') { Remove-ItemProperty -Path $rk -Name $n -Force; Say "removed Run value $rk\$n" } } }
-}
-$sa = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run'
-$sak = Get-Item $sa -ErrorAction SilentlyContinue
-if ($sak) { foreach ($n in $sak.GetValueNames()) {
-    if ($n -match 'OneDrive') { Remove-ItemProperty -Path $sa -Name $n -Force; Say "removed StartupApproved $n" } } }
-foreach ($sp in @("$profileRoot\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup",
-                  'C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup')) {
-    Get-ChildItem -LiteralPath $sp -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match 'OneDrive' } |
-        ForEach-Object { Remove-Item $_.FullName -Force; Say "removed startup shortcut $($_.FullName)" }
-}
-# NOTE: in-container Get-ScheduledTask has been observed returning ZERO while tasks existed.
-$tasks = Get-ScheduledTask -ErrorAction SilentlyContinue |
-         Where-Object { $_.TaskName -match 'OneDrive' -or $_.TaskPath -match 'OneDrive' }
-if ($tasks) { foreach ($t in $tasks) {
-    Unregister-ScheduledTask -TaskName $t.TaskName -TaskPath $t.TaskPath -Confirm:$false
-    Say "deleted scheduled task $($t.TaskName)" } }
-else { Say 'no OneDrive scheduled tasks' }
-
-# ------------------------------------------ 5. Registry config, sync roots, shell
-Head '5. Registry remnants'
-if (Test-Path 'HKCU:\Software\Microsoft\OneDrive') {
-    Remove-Item 'HKCU:\Software\Microsoft\OneDrive' -Recurse -Force; Say 'removed HKCU\Software\Microsoft\OneDrive'
-} else { Say 'HKCU\Software\Microsoft\OneDrive absent' }
-if (Test-Path 'HKCU:\Software\Classes\grvopen') {
-    Remove-Item 'HKCU:\Software\Classes\grvopen' -Recurse -Force; Say 'removed grvopen handler'
-}
-foreach ($h in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager',
-                 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager')) {
-    if (Test-Path $h) {
-        foreach ($kid in (Get-ChildItem $h -ErrorAction SilentlyContinue).PSChildName) {
-            # Remove OneDrive sync roots ONLY; other providers (Dropbox, etc.) live here too.
-            if ($kid -match 'OneDrive') { Remove-Item "$h\$kid" -Recurse -Force; Say "removed sync root $kid" }
-        }
+    $recent = Join-Path $profileRoot 'AppData\Roaming\Microsoft\Windows\Recent'; $removed = 0
+    foreach ($file in @(Get-ChildItem -Path $recent,"$recent\AutomaticDestinations","$recent\CustomDestinations" -File -Force -ErrorAction SilentlyContinue)) {
+        $bytes = [IO.File]::ReadAllBytes($file.FullName)
+        if ([Text.Encoding]::Unicode.GetString($bytes) -match 'OneDrive' -or [Text.Encoding]::ASCII.GetString($bytes) -match 'OneDrive') { Remove-Item -LiteralPath $file.FullName -Force; $removed++ }
     }
-}
-foreach ($p in @('HKCU:\Software\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
-                 'HKCU:\Software\Classes\WOW6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
-                 'HKLM:\SOFTWARE\Classes\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}',
-                 'HKLM:\SOFTWARE\Classes\WOW6432Node\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}')) {
-    if (Test-Path $p) {
-        # Unpin rather than delete: the CLSID is OS-owned.
-        Set-ItemProperty -Path $p -Name 'System.IsPinnedToNameSpaceTree' -Value 0 -Type DWord -Force
-        Say "unpinned namespace entry $p"
-    }
-}
+    Say "removed history files: $removed"
+} else { Say 'shell-history cleanup skipped (explicit -ClearShellHistory required)' }
 
-# ------------------------------------------------------ 6. Stale shell UI state
-Head '6. Stale shell state'
-foreach ($mru in @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\ComDlg32\LastVisitedPidlMRU',
-                   'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\ComDlg32\OpenSavePidlMRU',
-                   'HKCU:\Software\Microsoft\Windows\Shell\Bags\1\Desktop')) {
-    if (Test-Path $mru) { Remove-Item $mru -Recurse -Force; Say "cleared $mru" }
-}
-$recent = "$profileRoot\AppData\Roaming\Microsoft\Windows\Recent"
-$n = 0
-foreach ($f in (Get-ChildItem -Path $recent, "$recent\AutomaticDestinations", "$recent\CustomDestinations" `
-                -File -Force -ErrorAction SilentlyContinue)) {
-    try {
-        # Scan raw bytes: TargetPath resolves to empty once the target is gone.
-        $b = [IO.File]::ReadAllBytes($f.FullName)
-        if ([Text.Encoding]::Unicode.GetString($b) -match 'OneDrive' -or
-            [Text.Encoding]::ASCII.GetString($b)   -match 'OneDrive') {
-            Remove-Item $f.FullName -Force; $n++
-        }
-    } catch {}
-}
-Say "removed $n stale Recent/jumplist entries"
-
-# ------------------------------------------------- 7. Known-folder graph repair
-Head '7. Known-folder graph'
+Head '8. Known-folder graph'
 $skyDrive = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FolderDescriptions\{A52BBA46-E9E1-435f-B3D9-28DAA648C0F6}'
 if (-not (Test-Path $skyDrive)) {
-    # Missing parent breaks Explorer New Folder/rename system-wide (0x800401E5).
-    $fd = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey(
-        'SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FolderDescriptions\{A52BBA46-E9E1-435f-B3D9-28DAA648C0F6}')
-    $fd.SetValue('Name', 'OneDrive', [Microsoft.Win32.RegistryValueKind]::String)
-    $fd.SetValue('Category', 4, [Microsoft.Win32.RegistryValueKind]::DWord)
-    $fd.SetValue('ParentFolder', '{5E6C858F-0E22-4760-9AFE-EA3317B67173}', [Microsoft.Win32.RegistryValueKind]::String)
-    $fd.SetValue('RelativePath', 'OneDrive', [Microsoft.Win32.RegistryValueKind]::String)
-    $fd.Close()
-    Say 'RESTORED missing FOLDERID_SkyDrive definition (no PreCreate: creates nothing)'
-} else { Say 'FOLDERID_SkyDrive definition intact' }
+    $key = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FolderDescriptions\{A52BBA46-E9E1-435f-B3D9-28DAA648C0F6}')
+    $key.SetValue('Name','OneDrive',[Microsoft.Win32.RegistryValueKind]::String); $key.SetValue('Category',4,[Microsoft.Win32.RegistryValueKind]::DWord)
+    $key.SetValue('ParentFolder','{5E6C858F-0E22-4760-9AFE-EA3317B67173}',[Microsoft.Win32.RegistryValueKind]::String); $key.SetValue('RelativePath','OneDrive',[Microsoft.Win32.RegistryValueKind]::String); $key.Close()
+    Say 'restored: FOLDERID_SkyDrive (no PreCreate)'
+} else { Say 'present: FOLDERID_SkyDrive' }
 
-# ------------------------------------------------------------ 8. Data and files
-Head '8. Data folders'
-if (-not $SkipFolderDelete) {
+$removeTargets = @($oneDrive,(Join-Path $profileRoot 'AppData\Local\Microsoft\OneDrive'),(Join-Path $profileRoot 'AppData\Roaming\Microsoft\OneDrive'),'C:\ProgramData\Microsoft OneDrive','C:\Program Files\Microsoft OneDrive','C:\Program Files (x86)\Microsoft OneDrive')
+$removalFailures = New-Object System.Collections.Generic.List[string]
+if ($DeleteOneDriveData) {
+    Head '9. Explicit data deletion'
+    $remainingLocal = @(FilesUnder $oneDrive | Where-Object { -not (IsCloud $_) })
+    if ($remainingLocal.Count) { throw "Refusing deletion: $($remainingLocal.Count) local file(s) remain; first is $($remainingLocal[0].FullName)" }
     Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force
-    Start-Sleep -Seconds 2
-    foreach ($p in @($oneDrive,
-                     "$profileRoot\AppData\Local\Microsoft\OneDrive",
-                     "$profileRoot\AppData\Roaming\Microsoft\OneDrive",
-                     'C:\ProgramData\Microsoft OneDrive',
-                     'C:\Program Files\Microsoft OneDrive',
-                     'C:\Program Files (x86)\Microsoft OneDrive')) {
-        if (Test-Path -LiteralPath $p) {
-            Get-ChildItem -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue |
-                ForEach-Object { $_.Attributes = 'Normal' }
-            Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue
-            Say "$(if (Test-Path -LiteralPath $p) { 'FAILED to remove' } else { 'removed' }): $p"
-        } else { Say "absent: $p" }
+    foreach ($path in $removeTargets) {
+        if (-not (Test-Path -LiteralPath $path)) { Say "absent: $path"; continue }
+        try { Get-ChildItem -LiteralPath $path -Recurse -Force -ErrorAction Stop | ForEach-Object { $_.Attributes='Normal' }; Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop }
+        catch { $removalFailures.Add("$path :: $($_.Exception.Message)") }
+        if (Test-Path -LiteralPath $path) { $removalFailures.Add("$path :: still exists") } else { Say "removed: $path" }
     }
-    $orgs = Get-ChildItem -LiteralPath $profileRoot -Directory -Force -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like 'OneDrive*' }
-    if ($orgs) { Say "NOTE org folders still present (review manually): $($orgs.Name -join ', ')" }
-} else { Say 'SkipFolderDelete: data folders left in place' }
-
+} else { Say 'data folders retained (explicit -DeleteOneDriveData required)' }
+# Known-folder resolution is cached by Explorer. Restart it for every applied repair,
+# regardless of whether data deletion was requested.
+Get-Process explorer -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep 2
 if (-not (Get-Process explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
-Start-Sleep -Seconds 8
+Start-Sleep 5
 
-# ------------------------------------------------------------------- 9. Audit
-Head '9. AUDIT'
-$checks = [ordered]@{}
-foreach ($kf in $kfNames) {
-    $v = (Get-Item $usfPath).GetValue($kf.Name, '(absent)', 'DoNotExpandEnvironmentNames')
-    if ($v -ne '(absent)') { $checks["USF $($kf.Name) not in OneDrive"] = ($v -notlike '*OneDrive*') }
+Head '10. AUDIT'
+$checks = [ordered]@{}; $usf = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($usfSub,$false); $sf = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($sfSub,$false)
+foreach ($item in $folders) {
+    $raw = "%USERPROFILE%\$($item.Folder)"; $expanded = Join-Path $profileRoot $item.Folder
+    $checks["USF $($item.Name) exact"] = ExactRegistryValue $usf $item.Name $raw ExpandString -Raw
+    $checks["SF $($item.Name) exact"] = ExactRegistryValue $sf $item.Name $expanded String
 }
-foreach ($nm in @('Desktop','Personal','My Pictures')) {
-    $v = (Get-Item $sfPath).GetValue($nm, '(absent)')
-    if ($v -ne '(absent)') { $checks["SF $nm not in OneDrive"] = ($v -notlike '*OneDrive*') }
-}
-$checks['OneDrive data folder gone']   = $SkipFolderDelete -or -not (Test-Path -LiteralPath $oneDrive)
-$checks['OneDrive.exe not running']    = -not [bool](Get-Process OneDrive -ErrorAction SilentlyContinue)
-$checks['no OneDrive scheduled tasks'] = -not [bool](Get-ScheduledTask -ErrorAction SilentlyContinue |
-                                            Where-Object { $_.TaskName -match 'OneDrive' })
-$checks['HKCU OneDrive key gone']      = -not (Test-Path 'HKCU:\Software\Microsoft\OneDrive')
-$checks['DisableFileSyncNGSC=1']       = (Get-Item 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive').GetValue('DisableFileSyncNGSC') -eq 1
-$checks['KFMBlockOptIn=1']             = (Get-Item 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive').GetValue('KFMBlockOptIn') -eq 1
-$checks['FOLDERID_SkyDrive present']   = Test-Path $skyDrive
-$checks['Desktop resolves local']      = ([Environment]::GetFolderPath('Desktop') -notlike '*OneDrive*')
-
+if ($usf) { $usf.Close() }; if ($sf) { $sf.Close() }
+$remainingTasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -match 'OneDrive' -or $_.TaskPath -match 'OneDrive' })
+$checks['client executables absent'] = -not [bool]@($clientPaths | Where-Object { Test-Path -LiteralPath $_ }).Count
+$checks['OneDrive.exe stopped'] = -not [bool](Get-Process OneDrive -ErrorAction SilentlyContinue)
+$checks['tasks absent by name and path'] = -not [bool]$remainingTasks.Count
+$checks['HKCU config absent'] = -not (Test-Path 'HKCU:\Software\Microsoft\OneDrive')
+$checks['DisableFileSyncNGSC=1'] = (Get-ItemPropertyValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive' 'DisableFileSyncNGSC' -ErrorAction SilentlyContinue) -eq 1
+$checks['PreventNetworkTrafficPreUserSignIn=1'] = (Get-ItemPropertyValue 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive' 'PreventNetworkTrafficPreUserSignIn' -ErrorAction SilentlyContinue) -eq 1
+$checks['KFMBlockOptIn=1'] = (Get-ItemPropertyValue 'HKLM:\SOFTWARE\Policies\Microsoft\OneDrive' 'KFMBlockOptIn' -ErrorAction SilentlyContinue) -eq 1
+$checks['FOLDERID_SkyDrive present'] = Test-Path $skyDrive
+$checks['Desktop exact local target'] = (Canon ([Environment]::GetFolderPath('Desktop'))) -eq (Canon (Join-Path $profileRoot 'Desktop'))
+$checks['Documents exact local target'] = (Canon ([Environment]::GetFolderPath('MyDocuments'))) -eq (Canon (Join-Path $profileRoot 'Documents'))
+$checks['Pictures exact local target'] = (Canon ([Environment]::GetFolderPath('MyPictures'))) -eq (Canon (Join-Path $profileRoot 'Pictures'))
+if ($DeleteOneDriveData) { $checks['data tree absent'] = -not (Test-Path -LiteralPath $oneDrive); $checks['all deletions succeeded'] = -not [bool]$removalFailures.Count }
 $fail = 0
-foreach ($c in $checks.GetEnumerator()) {
-    Say ("[{0}] {1}" -f $(if ($c.Value) { 'PASS' } else { 'FAIL'; }), $c.Key)
-    if (-not $c.Value) { $fail++ }
-}
-Say ''
-Say "RESULT: $($checks.Count - $fail)/$($checks.Count) checks passed"
-Say "Desktop resolves to: $([Environment]::GetFolderPath('Desktop'))"
-Say ''
-Say 'REMAINING HUMAN STEP: in the GUI, right-click the desktop -> New -> Folder, then'
-Say 'rename it. Confirm the path is the local profile. Filesystem tests pass even when'
-Say 'the shell is broken, so only this proves it.'
-if ($fail -gt 0) { Say ''; Say 'One or more checks FAILED. If they failed while appearing correct in-session,'; Say 'suspect the packaged-app registry overlay - see references/detect-container.md.' }
+foreach ($check in $checks.GetEnumerator()) { $label = if ($check.Value) {'PASS'} else {'FAIL'}; Say "[$label] $($check.Key)"; if (-not $check.Value) { $fail++ } }
+foreach ($failure in $removalFailures) { Say "[FAIL] removal: $failure" }
+Say "RESULT: $($checks.Count-$fail)/$($checks.Count) checks passed"
+Say "HUMAN TEST: create and rename a Desktop folder; confirm $(Join-Path $profileRoot 'Desktop')."
+if ($fail -or $removalFailures.Count) { exit 1 }

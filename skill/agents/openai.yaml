@@ -1,0 +1,4 @@
+interface:
+  display_name: "OneDrive Exorcism"
+  short_description: "Safely remove OneDrive and repair folders"
+  default_prompt: "Use $onedrive-exorcism to inventory this Windows machine and safely undo OneDrive folder redirection."

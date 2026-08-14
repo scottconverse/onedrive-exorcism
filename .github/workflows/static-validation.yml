@@ -1,0 +1,17 @@
+name: Static validation
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse and inspect remediation scripts without executing them
+        shell: pwsh
+        run: ./tests/Validate-Scripts.ps1
