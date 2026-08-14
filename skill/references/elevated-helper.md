@@ -12,37 +12,44 @@ Scripts must live under a trusted root — `C:\dev\`, `%USERPROFILE%\Documents\C
 `%USERPROFILE%\.claude\`, or `%USERPROFILE%\AppData\Local\Temp\ClaudeElevatedHelper\`.
 
 ```powershell
-$jobId = "job-$(Get-Date -Format 'HHmmss')"
+$jobId = "job-$([guid]::NewGuid().ToString('N'))"
 @{ action = 'RunTrustedPowerShellScript'
    scriptPath = "$env:TEMP\ClaudeElevatedHelper\myscript.ps1" } |
   ConvertTo-Json | Set-Content "C:\dev\ClaudeElevatedHelper\queue\$jobId.json" -Encoding UTF8
 Start-ScheduledTask -TaskName 'ClaudeElevatedDevHelper'
+$completed = $false
 foreach ($i in 1..60) {
   Start-Sleep -Seconds 3
   $ok  = "C:\dev\ClaudeElevatedHelper\done\$jobId.result.json"
   $bad = "C:\dev\ClaudeElevatedHelper\failed\$jobId.error.json"
-  if (Test-Path $ok)  { (Get-Content $ok -Raw | ConvertFrom-Json).result.stdout; break }
-  if (Test-Path $bad) { Get-Content $bad -Raw; break }
+  if (Test-Path $ok) {
+    $result = Get-Content $ok -Raw | ConvertFrom-Json
+    if ($result.result.stderr) { Write-Error $result.result.stderr }
+    $result.result.stdout
+    $completed = $true
+    break
+  }
+  if (Test-Path $bad) { throw (Get-Content $bad -Raw) }
 }
+if (-not $completed) { throw "Elevated helper timed out after 180 seconds: $jobId" }
 ```
 
 Notes: the helper processes the queue once per trigger and exits; a run takes ~15-90s.
 Poll for the result file rather than assuming immediate completion. Capture both
 `stdout` and `stderr` from the result JSON.
 
-## Channel B: a one-shot scheduled task (works anywhere)
+## Channel B: a one-shot scheduled task (portable fallback)
 
-```powershell
-$act = New-ScheduledTaskAction -Execute 'powershell.exe' `
-  -Argument '-NoProfile -ExecutionPolicy Bypass -File "C:\dev\tmp\fix.ps1"'
-$pri = New-ScheduledTaskPrincipal -UserId $env:USERNAME -RunLevel Highest
-Register-ScheduledTask -TaskName 'ClaudeOneShot' -Action $act -Principal $pri -Force
-Start-ScheduledTask -TaskName 'ClaudeOneShot'
-# poll for an output file the script writes, then:
-Unregister-ScheduledTask -TaskName 'ClaudeOneShot' -Confirm:$false
-```
+Use a unique task name and a wrapper script under a trusted, ACL-checked directory. The
+wrapper must write a result JSON atomically containing its execution identity, exit code,
+stdout, and stderr. Register the task for the **same interactive user** with `RunLevel
+Highest`, start it, and poll both the task state and result file with a finite timeout.
+Reject a missing/malformed result, unexpected identity, or nonzero exit code. Always remove
+the task in `finally`. Do not use SYSTEM: this skill intentionally modifies the target
+user's `HKCU`.
 
-Have the script write its own transcript to a file; you cannot read the task's console.
+This channel is only "works anywhere" when the operator can approve task registration and
+the runner validates all of the properties above. Otherwise use Channel C.
 
 ## Channel C: ask the user
 
@@ -57,4 +64,6 @@ elevated PowerShell window, and have them paste back the audit output.
 - Print a `=== BEFORE ===` / `=== AFTER ===` block for every value you change; that
   output is your only evidence.
 - Make everything idempotent and safe to re-run.
+- Resolve and print the execution SID and profile. Abort if they are not the intended user.
+- Fail on timeout, malformed output, nonzero exit, or incomplete cleanup.
 - Avoid non-ASCII in printed strings (console encoding).

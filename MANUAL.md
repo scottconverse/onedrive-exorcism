@@ -42,29 +42,30 @@ cloud but become unreachable from this PC.
 **If you do not care about those files** (you can always get them from onedrive.com in a
 browser), continue now.
 
-The tool counts these for you and will warn you before it removes anything.
+The tool counts these for you and refuses changes unless cloud-only access loss is explicitly acknowledged.
 
 ---
 
-## Option A — with Claude Code (easiest)
+## Option A — with Claude Code or Codex (easiest)
 
-1. Copy the `skill` folder into your Claude skills folder and name it `onedrive-exorcism`:
+1. Copy the `skill` folder into your agent's skills folder and name it `onedrive-exorcism`:
 
    ```
    C:\Users\<your name>\.claude\skills\onedrive-exorcism\
+   C:\Users\<your name>\.codex\skills\onedrive-exorcism\
    ```
 
-2. Restart Claude Code so it notices the new skill.
-3. Type:
+2. Restart the agent so it notices the new skill.
+3. Invoke `/onedrive-exorcism` in Claude Code or `$onedrive-exorcism` in Codex.
 
    ```
    /onedrive-exorcism
    ```
 
-4. Answer the one question it asks — whether to download cloud-only files first.
+4. Review the inventory and answer whether to hydrate cloud-only files first.
 5. When it finishes, do the final test at the bottom of this page.
 
-Claude handles elevation, runs the work outside of any sandbox that would falsify the
+The agent handles elevation, runs the work outside of any sandbox that would falsify the
 results, and reports a pass/fail checklist.
 
 ## Option B — with the Claude website
@@ -90,7 +91,7 @@ Code on the machine you are fixing.
 3. Look before you leap — this changes nothing:
 
    ```powershell
-   .\skill\scripts\Invoke-OneDriveExorcism.ps1 -InventoryOnly
+   .\skill\scripts\Invoke-OneDriveExorcism.ps1
    ```
 
    Read the output. It tells you how many files are cloud-only and which folders are
@@ -99,8 +100,12 @@ Code on the machine you are fixing.
 4. If you are happy, run it for real:
 
    ```powershell
-   .\skill\scripts\Invoke-OneDriveExorcism.ps1
+   .\skill\scripts\Invoke-OneDriveExorcism.ps1 -Apply
    ```
+
+   If cloud-only files exist and you accept losing local access, add
+   `-ConfirmCloudOnlyLoss`. Data folders are retained unless you explicitly add
+   `-DeleteOneDriveData`; deletion is still refused while local files remain.
 
 5. Read the `AUDIT` section at the end. Every line should say `PASS`.
 
@@ -177,7 +182,7 @@ the icons shared by all users. Run the tool — repointing fixes it. Your files 
 ### The OneDrive folder came back
 
 Check whether it has anything in it besides `desktop.ini`. If it is effectively empty, it is
-cosmetic — delete it. If files are landing in it again, run `-InventoryOnly` and look at the
+cosmetic — delete it. If files are landing in it again, run without `-Apply` and look at the
 redirection list; if anything shows `HIJACKED`, run the full tool from an elevated window
 outside any packaged app.
 
@@ -194,6 +199,6 @@ account — your files are still online.
 Open an issue with:
 
 - Your Windows version (`winver`)
-- The full output of `Invoke-OneDriveExorcism.ps1 -InventoryOnly`
+- The full output of `Invoke-OneDriveExorcism.ps1` without `-Apply`
 - The exact error text or a screenshot
 - Whether you ran it from a plain Administrator PowerShell window or inside another app

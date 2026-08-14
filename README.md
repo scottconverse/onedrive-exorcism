@@ -4,8 +4,8 @@
 everyone gets stuck — and on some machines your fix silently never reaches the registry
 at all.**
 
-A Windows playbook, a Claude skill, and two PowerShell scripts for permanently removing
-OneDrive *and* repairing the damage it leaves behind.
+A Windows playbook, a portable skill for Claude and Codex, and two PowerShell scripts for
+safely removing OneDrive *and* repairing the damage it leaves behind.
 
 [Landing page](https://scottconverse.github.io/onedrive-exorcism/) &middot;
 [Playbook](PLAYBOOK.md) &middot;
@@ -66,34 +66,36 @@ repairs this, and is useful on its own even if OneDrive was never your problem.
 
 ## Quick start
 
-### With Claude Code (recommended)
+### With Claude Code or Codex (recommended)
 
-Copy `skill/` into your skills directory as `onedrive-exorcism`:
+Copy `skill/` into your agent's skills directory as `onedrive-exorcism`:
 
 ```
 ~/.claude/skills/onedrive-exorcism/
+~/.codex/skills/onedrive-exorcism/
 ```
 
-Then ask for it by name:
+Then invoke it using the agent's syntax:
 
 ```
 /onedrive-exorcism
+$onedrive-exorcism
 ```
 
-Claude loads the traps and boundaries, runs the script through an out-of-container
+The agent loads the traps and boundaries, runs the script through an out-of-container
 channel, and reports a PASS/FAIL audit. You can also upload
 [the packaged skill](#packaging-for-claudeai) to your Claude account.
 
-### Without Claude — plain PowerShell
+### Without an agent — plain PowerShell
 
 Open an **elevated** PowerShell window (not inside any packaged app terminal) and:
 
 ```powershell
 # 1. Look before you leap: reports cloud-only files and current redirection. Changes nothing.
-.\skill\scripts\Invoke-OneDriveExorcism.ps1 -InventoryOnly
+.\skill\scripts\Invoke-OneDriveExorcism.ps1
 
 # 2. Do it.
-.\skill\scripts\Invoke-OneDriveExorcism.ps1
+.\skill\scripts\Invoke-OneDriveExorcism.ps1 -Apply
 
 # Explorer New Folder / rename broken, regardless of OneDrive?
 .\skill\scripts\Repair-KnownFolderGraph.ps1
@@ -107,8 +109,8 @@ acceptance test.
 
 **Cloud-only files disappear from your PC.** Files with a cloud icon exist *only* at
 onedrive.com. Removing OneDrive makes them unreachable locally — they are not deleted from
-the cloud, but they are gone from this machine. `-InventoryOnly` counts them first. If the
-count is not zero, download what you need before proceeding.
+the cloud, but they are gone from this machine. Inventory is the default. If the count is
+not zero, hydrate what you need or explicitly pass `-ConfirmCloudOnlyLoss` with `-Apply`.
 
 **Cosmetic fallout is normal:** desktop icon positions reshuffle, the taskbar blinks when
 Explorer restarts, and each app's save dialog forgets its last-used folder once.
@@ -120,14 +122,15 @@ regenerates and the deletion looks haunted.
 
 | # | Step | Why |
 |---|------|-----|
-| 1 | Inventory cloud-only files | The one genuine decision point |
-| 2 | Repoint known folders | Both `User Shell Folders` and `Shell Folders`, names *and* GUID twins |
-| 3 | Lock policy | `KFMBlockOptIn`, `DisableFileSyncNGSC`, `PreventNetworkTrafficPreUserSignIn` |
-| 4 | Remove client, autostart, tasks, sync roots | The updater task is a live path back onto the machine |
-| 5 | Repair known-folder graph | Restores a missing built-in definition, registration only |
-| 6 | Clear stale shell state | Dialog MRU, Recent, jumplists, desktop view-state |
-| 7 | Delete the data folder **last** | And only with no Explorer window open in it |
-| 8 | Human GUI test | The only proof that counts |
+| 1 | Inventory cloud-only and local files | Read-only by default |
+| 2 | Preflight and migrate local known-folder files | Refuses collisions and reparse points |
+| 3 | Repoint known folders | Both `User Shell Folders` and `Shell Folders`, names *and* GUID twins |
+| 4 | Lock policy | `KFMBlockOptIn`, `DisableFileSyncNGSC`, `PreventNetworkTrafficPreUserSignIn` |
+| 5 | Remove client, autostart, tasks, sync roots | The updater task is a live path back onto the machine |
+| 6 | Repair known-folder graph | Restores a missing built-in definition, registration only |
+| 7 | Optionally clear stale shell state | Explicit `-ClearShellHistory` due to cosmetic impact |
+| 8 | Optionally delete data **last** | Explicit switch; refuses remaining local files |
+| 9 | Human GUI test | The only proof that counts |
 
 ## Where to stop
 
@@ -158,7 +161,8 @@ that machine.
 PLAYBOOK.md                      Full technical procedure and error signatures
 MANUAL.md                        Step-by-step user manual, plain language
 docs/index.html                  Landing page (GitHub Pages)
-skill/SKILL.md                   The Claude skill
+skill/SKILL.md                   Shared Claude/Codex skill instructions
+skill/agents/openai.yaml         Optional Codex UI metadata; ignored by Claude
 skill/scripts/                   Invoke-OneDriveExorcism.ps1, Repair-KnownFolderGraph.ps1
 skill/references/                Container detection, out-of-container execution
 ```
@@ -184,5 +188,5 @@ PowerShell 7. Some steps require elevation.
 MIT — see [LICENSE](LICENSE).
 
 **No warranty.** These scripts modify the registry, delete folders, and remove scheduled
-tasks. Read them, run `-InventoryOnly` first, and make sure your files are stored locally
+tasks. Read them, run the default inventory first, and make sure your files are stored locally
 before you proceed.

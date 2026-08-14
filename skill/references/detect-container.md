@@ -11,7 +11,9 @@ $p = (Get-Process -Id $PID).Path
 "Package family: $(Get-AppxPackage -Name 'Claude*' -EA SilentlyContinue | Select-Object -Expand PackageFamilyName)"
 ```
 
-If Claude Code is hosted by the Claude desktop app (MSIX), assume the overlay is
+If an agent is hosted by a packaged desktop app, assume the overlay is possible. The
+Claude Desktop package check above is a confirmed positive signal, not a claim that this
+problem is exclusive to Claude. When that signal is present, assume the overlay is
 active. Do not spend time proving it per-key.
 
 ## Positive proof (when you need it)

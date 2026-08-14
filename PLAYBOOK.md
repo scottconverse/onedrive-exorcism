@@ -108,7 +108,8 @@ repoint and lock policy *before* deleting, or the folder regenerates.
 ### 3.1 Repoint the known folders
 
 Write `ExpandString` (`REG_EXPAND_SZ`) to `User Shell Folders` using `%USERPROFILE%`, and
-plain `String` absolute paths to `Shell Folders`. Only set values that already exist.
+plain `String` absolute paths to `Shell Folders`. Create missing required values and audit
+their exact values and registry types.
 
 ```powershell
 $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
@@ -126,7 +127,7 @@ Create any missing local target folders before restarting Explorer.
 |-------|-----|--------|
 | `KFMBlockOptIn=1` | `HKLM\SOFTWARE\Policies\Microsoft\OneDrive` | Blocks folder-backup opt-in |
 | `DisableFileSyncNGSC=1` | `HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive` | "Prevent the usage of OneDrive for file storage" |
-| `PreventNetworkTrafficPreUserSignIn=1` | `HKLM\SOFTWARE\Policies\Microsoft\Windows\OneDrive` | No network traffic before sign-in |
+| `PreventNetworkTrafficPreUserSignIn=1` | `HKLM\SOFTWARE\Policies\Microsoft\OneDrive` | No network traffic before sign-in |
 
 Set these **before** removing the client, so a reinstall cannot redirect anything.
 
@@ -188,7 +189,12 @@ reference it, restore a minimal definition:
 Deliberately **no `PreCreate`** — the definition registers the folder without creating it.
 With policy set and shell folders local, a complete `FolderDescriptions` set creates nothing.
 
-### 3.8 Delete the data folder — last
+### 3.8 Optionally delete the data folder — last
+
+Data folders are retained unless `-DeleteOneDriveData` is explicit. The script first
+migrates local known-folder files, refuses collisions and reparse points, and refuses
+deletion while any locally available file remains. Cloud-only placeholders also require
+`-ConfirmCloudOnlyLoss`.
 
 Clear read-only attributes, stop Explorer, delete, then restart Explorer. Deleting while an
 Explorer window sits in that path causes window-restore to recreate it, which reads exactly
@@ -211,9 +217,10 @@ hold the only local copy of something.
 
 ## 4. Verification
 
-Automated (out-of-container) — `Invoke-OneDriveExorcism.ps1` ends with a PASS/FAIL audit
-covering all six known-folder values in both keys, folder removal, process, scheduled tasks,
-config key, all three policies, the folder description, and resolved Desktop path.
+Automated (out-of-container) — `Invoke-OneDriveExorcism.ps1 -Apply` ends with an exact
+PASS/FAIL audit covering all six mappings in both keys, value types, client state, task
+names and paths, all policies, requested deletions, and resolved local folder paths. Any
+failure returns a nonzero exit code.
 
 **Then the human step, which no script can replace:** right-click the desktop → New →
 Folder → rename it → confirm the path is under the local profile. Filesystem-level tests
