@@ -15,7 +15,8 @@ description: >-
 Removing the OneDrive *app* does not un-redirect the folders, and when an agent runs inside
 a packaged desktop app, the fix can silently land in a private
 virtual registry so it verifies perfectly and changes nothing. Both traps have cost
-multi-day debugging sessions. Work through this in order.
+multi-day debugging sessions. Check the container first, because every later step is
+unverifiable if the overlay is active.
 
 ## Trap 1: the container lies (check this FIRST)
 
