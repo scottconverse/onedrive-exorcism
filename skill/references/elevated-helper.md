@@ -59,11 +59,11 @@ elevated PowerShell window, and have them paste back the audit output.
 
 ## Writing scripts for these channels
 
-- Write the file with the `Write` tool, then reference it by path — do not try to pass
-  long inline script text through the job JSON.
+- Write the script to a file and pass its path: long inline text breaks the job JSON
+  (unescaped backslashes make it invalid).
 - Print a `=== BEFORE ===` / `=== AFTER ===` block for every value you change; that
   output is your only evidence.
-- Make everything idempotent and safe to re-run.
+- Make scripts idempotent so a failed or repeated job can be re-run without extra damage.
 - Resolve and print the execution SID and profile. Abort if they are not the intended user.
 - Fail on timeout, malformed output, nonzero exit, or incomplete cleanup.
 - Avoid non-ASCII in printed strings (console encoding).
